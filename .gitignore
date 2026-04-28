@@ -1,2 +1,10 @@
 *.npy
 python-manager-26.0.msix
+data/
+*.mp4
+*.avi
+*.mov
+*.npy
+__pycache__/
+python-manager-26.0*
+py
