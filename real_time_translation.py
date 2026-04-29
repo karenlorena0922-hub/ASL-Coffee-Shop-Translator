@@ -7,6 +7,7 @@ from tensorflow.keras.models import load_model
 # 1. Safe paths
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "action.h5"
+CAMERA_INDEXES = (0, 1, 2)
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
@@ -35,16 +36,60 @@ def extract_keypoints(results):
 
     return np.concatenate([face, lh, rh])
 
+def swap_hands(sequence_data):
+    """Return a copy with left-hand and right-hand landmarks exchanged."""
+    swapped = np.array(sequence_data, copy=True)
+    left_start = 468 * 3
+    left_end = left_start + (21 * 3)
+    right_start = left_end
+    right_end = right_start + (21 * 3)
+
+    swapped[:, left_start:left_end] = sequence_data[:, right_start:right_end]
+    swapped[:, right_start:right_end] = sequence_data[:, left_start:left_end]
+    return swapped
+
+def predict_with_hand_swap(sequence_data):
+    """Try the original hand side and the opposite hand side, then keep the stronger prediction."""
+    original = np.array(sequence_data)
+    swapped = swap_hands(original)
+    batch = np.array([original, swapped])
+    predictions = model.predict(batch, verbose=0)
+
+    original_confidence = np.max(predictions[0])
+    swapped_confidence = np.max(predictions[1])
+
+    if swapped_confidence > original_confidence:
+        return predictions[1], "swapped"
+    return predictions[0], "normal"
+
+def format_top_predictions(prediction, count=3):
+    top_indexes = np.argsort(prediction)[-count:][::-1]
+    return " | ".join(
+        f"{actions[index]} {int(prediction[index] * 100)}%"
+        for index in top_indexes
+    )
+
 # 5. Real-time Logic Variables
 sequence = []
 threshold = 0.6
 sequence_length = 40
+use_hand_swap = False
+last_prediction = "Waiting for model..."
 
-# Try camera 2 first. If it does not work, change this to 0 or 1.
-cap = cv2.VideoCapture(2)
+def open_camera(indexes):
+    """Open the first available camera from a small list of common indexes."""
+    for index in indexes:
+        camera = cv2.VideoCapture(index)
+        if camera.isOpened():
+            print(f"Using camera index: {index}")
+            return camera
+        camera.release()
+    return None
 
-if not cap.isOpened():
-    raise RuntimeError("Camera not found. Try changing cv2.VideoCapture(2) to 0 or 1.")
+cap = open_camera(CAMERA_INDEXES)
+
+if cap is None:
+    raise RuntimeError(f"Camera not found. Tried indexes: {CAMERA_INDEXES}")
 
 print("--- Karen's Coffee Shop: Translator Active ---")
 print(f"Using model: {MODEL_PATH}")
@@ -61,24 +106,40 @@ while cap.isOpened():
     results = holistic.process(image)
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-    # Extract coordinates and add to buffer
-    keypoints = extract_keypoints(results)
-    sequence.append(keypoints)
-    sequence = sequence[-sequence_length:]
-
     # UI default status
+    face_seen = results.face_landmarks is not None
+    left_seen = results.left_hand_landmarks is not None
+    right_seen = results.right_hand_landmarks is not None
+    hand_seen = left_seen or right_seen
     status_msg = f"Buffer: {len(sequence)}/{sequence_length} frames"
+    detection_msg = f"Face:{'Y' if face_seen else 'N'}  Left:{'Y' if left_seen else 'N'}  Right:{'Y' if right_seen else 'N'}"
     border_color = (150, 150, 150)
+
+    if hand_seen:
+        keypoints = extract_keypoints(results)
+        sequence.append(keypoints)
+        sequence = sequence[-sequence_length:]
+        status_msg = f"Buffer: {len(sequence)}/{sequence_length} frames"
+    else:
+        sequence.clear()
+        status_msg = "Show your hand inside the camera frame"
+        last_prediction = "No hand detected"
+        border_color = (0, 200, 255)
 
     # Prediction Logic
     if len(sequence) == sequence_length:
-        res = model.predict(np.expand_dims(sequence, axis=0), verbose=0)[0]
+        if use_hand_swap:
+            res, hand_mode = predict_with_hand_swap(sequence)
+        else:
+            res = model.predict(np.expand_dims(sequence, axis=0), verbose=0)[0]
+            hand_mode = "normal"
+
         current_idx = np.argmax(res)
         confidence = res[current_idx]
+        action_name = actions[current_idx]
+        last_prediction = f"Top: {format_top_predictions(res)} ({hand_mode})"
 
         if confidence > threshold:
-            action_name = actions[current_idx]
-
             if action_name != "nothing":
                 status_msg = f"ORDER: {action_name.upper()} ({int(confidence * 100)}%)"
                 border_color = (0, 255, 0)
@@ -90,6 +151,25 @@ while cap.isOpened():
     h, w = image.shape[:2]
 
     cv2.rectangle(image, (0, 0), (w, h), border_color, 12)
+    cv2.rectangle(image, (0, 0), (w, 64), (30, 30, 30), -1)
+    cv2.putText(
+        image,
+        detection_msg,
+        (20, 26),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.55,
+        (255, 255, 255),
+        1
+    )
+    cv2.putText(
+        image,
+        last_prediction,
+        (20, 52),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.55,
+        (255, 255, 255),
+        1
+    )
     cv2.rectangle(image, (0, h - 60), (w, h), (30, 30, 30), -1)
     cv2.putText(
         image,
